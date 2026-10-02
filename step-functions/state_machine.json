@@ -1,0 +1,34 @@
+{
+  "Comment": "TLC trip data pipeline",
+  "StartAt": "RunCrawler",
+  "States": {
+    "RunCrawler": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+      "Parameters": { "Name": "raw-zone-crawler" },
+      "Next": "WaitForCrawler",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "Fail" }]
+    },
+    "WaitForCrawler": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "Cleaning"
+    },
+    "Cleaning": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": { "JobName": "Cleaning" },
+      "Next": "Processed",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "Fail" }]
+    },
+    "Processed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+      "Parameters": { "Name": "Processed" },
+      "Next": "Success",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "Fail" }]
+    },
+    "Success": { "Type": "Succeed" },
+    "Fail": { "Type": "Fail", "Cause": "Pipeline step failed" }
+  }
+}
