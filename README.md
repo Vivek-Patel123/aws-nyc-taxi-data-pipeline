@@ -1,93 +1,128 @@
 # NYC Taxi Data Pipeline
 
-A batch ELT pipeline that ingests NYC TLC taxi trip data, cleans and transforms it with AWS Glue, loads it into a Redshift star schema, and orchestrates the whole flow with Step Functions — with monitoring via CloudWatch and SNS.
+A batch pipeline that ingests NYC TLC taxi trip data, cleans and partitions it with AWS Glue (PySpark), and loads it into a Redshift star schema. Step Functions orchestrates the ingestion and transformation stages, with CloudWatch and SNS alerting on failures.
 
 Built as a hands-on project while studying for the AWS Certified Data Engineer - Associate (DEA-C01) exam.
 
 ## Problem
 
-Raw taxi trip data (3.8M+ rows/month) needs to go from a single messy source file to a queryable, analytics-ready warehouse — with the kind of data quality issues real pipelines actually hit: nullable fields, dead columns, and corrupted timestamps (the source file contained trips dated as far back as 2008 despite being a "June 2026" extract).
+Raw taxi trip data (3.8M rows for one month) has to go from a single messy source file to a queryable, analytics-ready warehouse. The file has the data quality problems real pipelines hit: nullable fields, a dead column, and corrupted timestamps. A "June 2026" extract contained trips dated as far back as 2008.
 
 ## Architecture
 
-```
-NYC TLC Open Data (Parquet)
-        |
-        v
-  S3 raw-zone  ──────────────┐
-        |                    │
-        v                    │
-  Glue Crawler                │  <- catalogs raw schema (metadata only)
-        |                    │
-        v                    │
-  Glue ETL Job (PySpark)      │  <- cleans, filters, partitions by date
-        |                    │
-        v                    │
-  S3 processed-zone           │  (partitioned: year/month/day)
-        |                    │
-        v                    │
-  Glue Crawler (processed)    │  <- catalogs cleaned schema
-        |                    │
-        v                    │
-  Redshift Serverless         │
-   - fact_trips               │
-   - dim_date / dim_location / dim_vendor
-        |
-        v
-  Analytical SQL queries
+```mermaid
+flowchart TD
+    A["NYC TLC trip data<br/>Parquet"] --> B[("S3 raw-zone")]
+    B --> C["Glue crawler<br/>catalogs raw schema"]
+    C --> D["Glue ETL job<br/>PySpark: clean, filter, partition"]
+    D --> E[("S3 processed-zone<br/>partitioned by year/month/day")]
+    E --> F["Glue crawler<br/>catalogs processed schema"]
+    E -.->|manual COPY| G[("Redshift Serverless<br/>star schema")]
+    G --> H["Analytical SQL queries"]
 
-Orchestration: AWS Step Functions wires the crawler -> Glue job -> crawler
-chain together, with error handling (Catch) routing failures to a Fail
-state. CloudWatch alarm on ExecutionsFailed -> SNS -> email notification.
+    subgraph SF["Step Functions state machine"]
+        C
+        D
+        F
+    end
+
+    SF -.->|execution failed| I["CloudWatch alarm"]
+    I --> J["SNS email alert"]
 ```
+
+![Successful Step Functions execution](docs/images/step-functions-success.png)
 
 **Why this stack:**
-- **S3 two-zone split** (raw/processed) — raw data stays untouched as a rebuild source; processed data is partitioned for query efficiency.
-- **Glue (managed Spark)** over a plain script — scales past single-machine memory, serverless, no cluster management. Chosen over EMR for this use case since Glue's job/crawler model fits a straightforward batch ETL better than manually managing a cluster.
-- **Redshift over querying S3 directly (Athena)** — this is a warehouse built for sustained, repeated analytical queries (joins across dimension tables, aggregations), not ad-hoc one-off lookups.
-- **Star schema** — `fact_trips` holds measurable values; `dim_date`/`dim_location`/`dim_vendor` hold descriptive context. Avoids repeating text across millions of rows and makes aggregation queries a simple join + group-by.
-- **Step Functions over manual triggering** — the pipeline needs to run as one coordinated flow with error handling, not three separately-clicked console actions.
+
+- **Two S3 zones (raw and processed).** Raw data stays untouched as a rebuild source. Processed data is partitioned for efficient queries.
+- **Glue (managed Spark) instead of a local script.** It scales past one machine's memory and needs no cluster management. It fits a straightforward batch ETL better than managing an EMR cluster.
+- **Redshift instead of querying S3 directly.** A warehouse suits repeated analytical queries (joins across dimensions, aggregations). Athena was still useful for quick validation of the processed data through the Glue Data Catalog.
+- **Star schema.** `fact_trips` holds the measurable values, and `dim_date`, `dim_location` and `dim_vendor` hold descriptive context. This avoids repeating text across millions of rows and keeps aggregations to a join plus a group-by.
+- **Step Functions instead of manual triggering.** The crawler, job and second crawler run as one coordinated flow, with failures routed to a Fail state.
 
 ## Data quality handling
 
-- Dropped a column (`request_source`) that was entirely null in the source file.
-- Dropped rows missing critical fields (`passenger_count`, `RatecodeID`).
+- Dropped `request_source`, which was entirely null.
+- Dropped rows missing `passenger_count` or `RatecodeID`.
 - Cast `store_and_fwd_flag` from a Y/N string to boolean.
-- **Filtered out-of-range timestamps** — the raw file contained trips dated outside June 2026, including one from 2008. Added an explicit date-range filter (`WHERE pickup_datetime BETWEEN '2026-06-01' AND '2026-07-01'`) rather than trusting the file's advertised date range.
+- **Filtered out-of-range timestamps** (`pickup >= '2026-06-01' AND pickup < '2026-07-01'`). The partition listing showed 36 partitions instead of the expected 30, including a `year=2008` partition. Profiling the output exposed the corrupted timestamps, and the filter removed them.
 
 ## Schema design
 
-`fact_trips` is distributed and sorted on `pickup_date_id` (`DISTKEY`/`SORTKEY`), since nearly every analytical query filters or groups by date — this keeps related rows physically together and reduces the data scanned per query.
+`fact_trips` uses `pickup_date_id` as both `DISTKEY` and `SORTKEY`, since most analytical queries filter or group by date. `dim_location` is loaded from TLC's taxi zone lookup table, `dim_vendor` from TLC's data dictionary, and `dim_date` is generated for June 1-30, 2026.
 
-## Debugging notes (the real work)
+## Results
 
-A pipeline that works on the first try usually means something's untested. These are the actual issues hit and fixed during the build:
+Trips and revenue by pickup borough (June 2026):
 
-- **IAM scoping, repeatedly.** Separate roles for Glue (raw-zone read vs. processed-zone write), Redshift's `COPY` role, and the Step Functions execution role each needed explicit, narrowly-scoped permissions — no single role "just worked" by default. Hit this independently for S3 writes, S3 reads, Glue crawler/job execution, and CloudWatch log delivery.
-- **Redshift COPY matches Parquet columns by name, not position.** A staging table built via `LIKE` carried over different column names than the source file (`pickup_location_id` vs. the file's `PULocationID`), causing silent NULL mapping and a `NOT NULL` constraint failure traced back to a column (`trip_id`) that a failed `ALTER TABLE DROP COLUMN` had left behind. Fixed by rebuilding the staging table with column names matching the file exactly.
-- **Type mismatches in Spectrum scans.** Spark wrote `passenger_count`/`ratecodeid`/`payment_type` as `bigint`, not the `smallint` originally assumed — Redshift doesn't silently narrow types, so the staging table had to match exactly.
-- **Stale Glue Catalog partitions.** After fixing the timestamp filter and re-running the ETL job, the catalog kept listing partitions (`year=2008`, etc.) for S3 paths that no longer existed — the crawler doesn't auto-remove stale partitions by default. Fixed by deleting and recrawling.
-- **Visual Step Functions designer left placeholder values.** Both `Glue: StartCrawler` states initially pointed at a nonexistent crawler named `MyData` — a template default that never got replaced. The resulting `AccessDeniedException` initially looked like an IAM problem; the real issue was a wrong resource name, not a missing permission.
-- **CloudWatch alarm statistic.** `ExecutionsFailed` is a count-type metric; alarms on count metrics should use `Sum`, not `Average`, to reliably catch isolated events.
+| Borough | Trips | Avg fare | Total revenue |
+|---|---|---|---|
+| Manhattan | 2,524,904 | $24.74 | $62,489,379 |
+| Queens | 277,077 | $74.27 | $20,579,415 |
+| Brooklyn | 13,212 | $33.86 | $447,410 |
+| N/A | 2,364 | $107.31 | $253,691 |
+| Unknown | 4,058 | $37.16 | $150,818 |
+| EWR | 569 | $118.15 | $67,227 |
+| Bronx | 1,475 | $43.70 | $64,460 |
+| Staten Island | 72 | $57.73 | $4,157 |
+
+Queens' high average fare likely reflects airport trips (JFK, LaGuardia), and EWR is the highest, as expected for long rides to Newark. `N/A` and `Unknown` are TLC's own zone IDs for trips with no valid GPS zone, so they are kept.
+
+![Borough revenue results](docs/images/redshift-borough-results.png)
+![Revenue by borough chart](docs/images/borough-revenue-chart.png)
+
+## Debugging notes
+
+These are the issues I hit and fixed during the build:
+
+- **IAM, in three places.** The Glue role was read-only and hit a `403` writing to `processed-zone`. Redshift's `COPY` role couldn't list `raw-zone`. The Step Functions role generated by the visual designer covered only Glue job runs, with no `StartCrawler` permission, and later needed CloudWatch log-delivery permissions. Each was fixed with a scoped inline policy.
+- **Two stacked Step Functions errors.** The first failure was `AccessDenied` on `StartCrawler`. After granting the permission, the next error was `EntityNotFound` for a crawler named `MyData`, a placeholder from the visual designer that I never replaced. Fixing one error exposed the other.
+- **Redshift `COPY` and Parquet.** Redshift matches Parquet columns by name, not by position. A staging table built with `LIKE` didn't line up with the file's columns (`PULocationID`, `tpep_pickup_datetime`), and the load failed with a `NOT NULL` error. I rebuilt it with names matching the file exactly.
+- **Parquet type mismatch.** Spark wrote `passenger_count` and `payment_type` as `bigint` and fares as `double`. The load failed with a Spectrum scan schema error until the staging table's types matched what Athena reported for the catalogued table.
+- **Stale catalog partitions.** After the date filter removed the bad partitions from S3, the Glue Data Catalog kept listing them. Deleting the table and recrawling fixed it.
+- **Resources in the wrong region.** The Glue job and crawler had been created in `us-east-1` while the buckets were in `us-east-2`. I recreated them in `us-east-2` so everything lined up.
+- **Redshift SQL limitation.** `generate_series` isn't supported for inserting into a user table, so `dim_date` is built with a `UNION ALL` of 30 dates.
+- **CloudWatch alarm.** The first alarm, using the `Average` statistic, never entered the alarm state on a deliberately failed execution. After switching to `Sum` (the usual statistic for count metrics like `ExecutionsFailed`) and re-testing, it fired and the SNS email arrived.
+
+![CloudWatch alarm history](docs/images/cloudwatch-alarm-history.png)
+
+## Known limitations
+
+- **The Redshift load is a manual step.** Step Functions automates ingestion through transformation (crawler, Glue job, crawler). The `COPY` into Redshift runs by hand in Query Editor v2. The next step would be adding Redshift Data API states to the state machine.
+- **Reruns of the fact load append.** `load_fact_trips.sql` inserts without clearing the table, so running it twice duplicates rows. An automated version needs a `TRUNCATE` or a partition-aware load.
+- **Null handling drops rows.** The null and date filters together removed roughly 1M of the 3.8M raw rows (about 26%). Imputing `passenger_count` and `RatecodeID` instead of dropping would keep more data, at the cost of inventing values.
+- **Fixed wait instead of polling.** The state machine waits 60 seconds after starting the crawler instead of polling until it reports `READY`.
+- **Single month of data.** The date filter and `dim_date` are hardcoded to June 2026.
+
+## Running it
+
+1. Create the two S3 buckets and upload the TLC trip file to the raw bucket and the zone lookup CSV under `lookup/`.
+2. Create the two Glue crawlers (raw and processed) and the Glue job from `glue-scripts/cleaning.py`, each with a scoped IAM role.
+3. Create the state machine from `step-functions/state_machine.json` and run it.
+4. Create a Redshift Serverless workgroup with a daily usage limit, then run the SQL files in `redshift/` in order: `create_tables.sql`, `load_dimensions.sql`, `load_fact_trips.sql`.
+5. Run the queries in `redshift/analytical_queries.sql`.
+
+Set an AWS Budgets alert before starting. Redshift is the first service that adds real cost.
 
 ## Stack
 
-- **Ingestion:** S3
+- **Storage:** S3
 - **Transformation:** AWS Glue (PySpark)
 - **Warehouse:** Amazon Redshift Serverless
 - **Orchestration:** AWS Step Functions
-- **Monitoring:** CloudWatch Alarms + SNS
+- **Monitoring:** CloudWatch alarm and SNS
 
 ## Repo structure
 
 ```
 glue-scripts/
-  cleaning.py              -- Glue ETL job: clean, filter, partition
+  cleaning.py              Glue ETL job: clean, filter, partition
 redshift/
-  create_tables.sql        -- star schema DDL
-  load_dimensions.sql      -- dim_date / dim_location / dim_vendor loads
-  load_fact_trips.sql      -- staging + fact_trips load
-  analytical_queries.sql   -- sample analytical queries
+  create_tables.sql        star schema DDL
+  load_dimensions.sql      dim_date / dim_location / dim_vendor loads
+  load_fact_trips.sql      staging table and fact_trips load
+  analytical_queries.sql   sample analytical queries
 step-functions/
-  state_machine.json       -- orchestration definition
+  state_machine.json       orchestration definition
+docs/images/               screenshots used in this README
 ```
